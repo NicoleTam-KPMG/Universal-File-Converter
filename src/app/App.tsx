@@ -1,6 +1,8 @@
-import { useState } from 'react';
-import { Upload, Download, CheckCircle2, AlertCircle, FileText, X, DownloadCloud, Loader2, Image as ImageIcon, FileCode, Film, Music, Info } from 'lucide-react';
+import { useState, useRef } from 'react';
+import { Upload, Download, CheckCircle2, AlertCircle, FileText, X, DownloadCloud, Loader2, Image as ImageIcon, FileCode, Film, Music, Info, RefreshCw } from 'lucide-react';
 import JSZip from 'jszip';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 type ConversionStatus = 'pending' | 'converting' | 'completed' | 'failed';
 
@@ -14,6 +16,7 @@ interface FileConversion {
   error?: string;
   fileSize: number;
   outputSize?: number;
+  progress?: number;
 }
 
 const SUPPORTED_CONVERSIONS = {
@@ -55,7 +58,7 @@ const SUPPORTED_CONVERSIONS = {
       flv: ['mp4'],
       mp4: ['webm']
     },
-    browserSupported: false
+    browserSupported: true // Now supported via FFmpeg WASM
   },
   audio: {
     formats: ['mp3', 'wav', 'ogg', 'aac', 'm4a', 'flac'],
@@ -70,7 +73,7 @@ const SUPPORTED_CONVERSIONS = {
       m4a: ['mp3'],
       flac: ['mp3']
     },
-    browserSupported: false
+    browserSupported: true // Now supported via FFmpeg WASM
   }
 };
 
@@ -115,6 +118,35 @@ export default function App() {
   const [conversions, setConversions] = useState<FileConversion[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
+  
+  // FFmpeg State
+  const [isFfmpegLoaded, setIsFfmpegLoaded] = useState(false);
+  const [isFfmpegLoading, setIsFfmpegLoading] = useState(false);
+  const [ffmpegError, setFfmpegError] = useState<string | null>(null);
+  const ffmpegRef = useRef(new FFmpeg());
+
+  const loadFfmpeg = async () => {
+    if (isFfmpegLoaded || isFfmpegLoading) return;
+    setIsFfmpegLoading(true);
+    setFfmpegError(null);
+    try {
+      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+      const ffmpeg = ffmpegRef.current;
+      
+      // Load FFmpeg WASM core
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      });
+      
+      setIsFfmpegLoaded(true);
+    } catch (error) {
+      console.error("FFmpeg load error:", error);
+      setFfmpegError("Failed to load FFmpeg engine. Your environment might lack required security headers.");
+    } finally {
+      setIsFfmpegLoading(false);
+    }
+  };
 
   // SRT to VTT conversion
   const convertSrtToVtt = (srt: string): string => {
@@ -274,6 +306,53 @@ export default function App() {
     });
   };
 
+  // Convert media formats using FFmpeg WASM
+  const convertMedia = async (conversion: FileConversion): Promise<Blob> => {
+    const ffmpeg = ffmpegRef.current;
+    
+    // Auto-load FFmpeg if it hasn't been loaded yet
+    if (!isFfmpegLoaded) {
+      await loadFfmpeg();
+    }
+    
+    if (!ffmpegRef.current.loaded) {
+      throw new Error("FFmpeg engine failed to load.");
+    }
+
+    const fileExt = conversion.fileName.split('.').pop()?.toLowerCase();
+    const inputName = `input_${conversion.id}.${fileExt}`;
+    const outputName = `output_${conversion.id}.${conversion.outputFormat}`;
+
+    // Write file to FFmpeg's virtual file system
+    await ffmpeg.writeFile(inputName, await fetchFile(conversion.inputFile));
+
+    // Listen for progress
+    ffmpeg.on('progress', ({ progress }) => {
+      setConversions(prev => prev.map(c => 
+        c.id === conversion.id 
+          ? { ...c, progress: Math.max(0, Math.min(100, Math.round(progress * 100))) } 
+          : c
+      ));
+    });
+
+    // Execute FFmpeg command (e.g., ffmpeg -i input.webm output.mp4)
+    await ffmpeg.exec(['-i', inputName, outputName]);
+
+    // Read the result
+    const data = await ffmpeg.readFile(outputName);
+    const mimeType = getFileType(conversion.fileName) === 'video' ? 'video' : 'audio';
+    const blob = new Blob([(data as Uint8Array).buffer], { type: `${mimeType}/${conversion.outputFormat}` });
+
+    // Clean up virtual file system
+    await ffmpeg.deleteFile(inputName);
+    await ffmpeg.deleteFile(outputName);
+
+    // Remove progress listener
+    ffmpeg.off('progress', () => {});
+
+    return blob;
+  };
+
   const processFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
 
@@ -327,6 +406,8 @@ export default function App() {
         outputBlob = await convertImage(conversion.inputFile, conversion.outputFormat);
       } else if (fileType === 'subtitle') {
         outputBlob = await convertSubtitle(conversion.inputFile, conversion.outputFormat);
+      } else if (fileType === 'video' || fileType === 'audio') {
+        outputBlob = await convertMedia(conversion);
       } else {
         throw new Error('Unsupported file type');
       }
@@ -472,401 +553,495 @@ export default function App() {
     conversions.find(c => c.id === id)?.status === 'completed'
   ).length;
 
-  const hasUnsupportedFiles = conversions.some(c => {
+  const hasMediaFiles = conversions.some(c => {
     const type = getFileType(c.fileName);
-    return (type === 'video' || type === 'audio') && c.status === 'failed';
+    return type === 'video' || type === 'audio';
   });
 
   const allAccepts = Object.values(SUPPORTED_CONVERSIONS).map(c => c.accepts).join(',');
 
   return (
-    <div className="min-h-screen bg-gray-50 p-8">
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-bold text-gray-900 mb-2">Universal File Format Converter</h1>
-          <p className="text-gray-600">Convert images, subtitles, video, and audio files</p>
-          <p className="text-sm text-gray-500 mt-1">100% private - no uploads, no cloud processing</p>
+    <div className="min-h-screen bg-slate-50 p-4 md:p-8 font-sans text-slate-900">
+      
+      {/* Header Section (Moved to the Top) */}
+      <div className="max-w-[1400px] mx-auto mb-8">
+        <div>
+          <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight mb-3">
+            Universal Converter
+          </h1>
+          <p className="text-slate-600 leading-relaxed text-sm max-w-2xl">
+            Convert images, subtitles, video, and audio files without ever leaving your browser.
+          </p>
+          <div className="inline-flex items-center gap-1.5 mt-4 px-3 py-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-semibold shadow-sm">
+            <CheckCircle2 className="w-4 h-4" />
+            100% Private — No Uploads
+          </div>
         </div>
+      </div>
 
-        {/* Warning for video/audio - only show if user uploaded unsupported files */}
-        {hasUnsupportedFiles && (
-          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
-            <div className="flex items-start gap-3">
-              <Info className="w-5 h-5 text-yellow-600 flex-shrink-0 mt-0.5" />
+      <div className="max-w-[1400px] mx-auto flex flex-col lg:flex-row gap-8 items-start">
+        
+        {/* Left Sidebar: Fixed content like Info */}
+        <div className="w-full lg:w-[380px] shrink-0 lg:sticky lg:top-8 flex flex-col gap-6">
+
+          {/* Info Section moved here */}
+          <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+            <h3 className="font-semibold text-slate-800 mb-5 flex items-center gap-2">
+              <Info className="w-5 h-5 text-blue-500" />
+              Supported Formats
+            </h3>
+            
+            <div className="space-y-6">
+              {/* Images */}
               <div>
-                <h3 className="font-semibold text-yellow-900 mb-1">Video & Audio Conversion Unavailable</h3>
-                <p className="text-sm text-yellow-800">
-                  Video and audio conversions require FFmpeg, which cannot run in this preview environment.
-                  Images and subtitle conversions work natively in your browser. To convert video/audio files,
-                  download this tool and run it locally with FFmpeg installed.
-                </p>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <ImageIcon className="w-4 h-4 text-emerald-500" /> Images
+                  </p>
+                  <span className="text-[10px] font-bold uppercase tracking-wider bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">Native</span>
+                </div>
+                <p className="text-xs text-slate-500 mb-2">PNG, JPG, WebP</p>
+                <div className="flex flex-wrap gap-1 text-[11px] font-medium text-slate-600">
+                  <span className="bg-slate-50 border border-slate-200 px-2 py-1 rounded-md">PNG → JPG</span>
+                  <span className="bg-slate-50 border border-slate-200 px-2 py-1 rounded-md">JPG → WebP</span>
+                  <span className="bg-slate-50 border border-slate-200 px-2 py-1 rounded-md">WebP → PNG</span>
+                </div>
+              </div>
+
+              {/* Subtitles */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <FileCode className="w-4 h-4 text-purple-500" /> Subtitles
+                  </p>
+                  <span className="text-[10px] font-bold uppercase tracking-wider bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full">Native</span>
+                </div>
+                <p className="text-xs text-slate-500 mb-2">SRT, VTT, SBV</p>
+                <div className="flex flex-wrap gap-1 text-[11px] font-medium text-slate-600">
+                  <span className="bg-slate-50 border border-slate-200 px-2 py-1 rounded-md">SRT → VTT</span>
+                  <span className="bg-slate-50 border border-slate-200 px-2 py-1 rounded-md">VTT → SRT</span>
+                  <span className="bg-slate-50 border border-slate-200 px-2 py-1 rounded-md">SRT → SBV</span>
+                </div>
+              </div>
+
+              <div className="h-px bg-slate-100 w-full" />
+
+              {/* Video */}
+              <div className="opacity-75">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <Film className="w-4 h-4 text-blue-500" /> Video
+                  </p>
+                  <span className="text-[10px] font-bold uppercase tracking-wider bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full">FFmpeg</span>
+                </div>
+                <p className="text-xs text-slate-500">MP4, WebM, AVI, MOV, MKV, FLV</p>
+              </div>
+
+              {/* Audio */}
+              <div className="opacity-75">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <Music className="w-4 h-4 text-orange-500" /> Audio
+                  </p>
+                  <span className="text-[10px] font-bold uppercase tracking-wider bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full">FFmpeg</span>
+                </div>
+                <p className="text-xs text-slate-500">MP3, WAV, OGG, AAC, M4A, FLAC</p>
               </div>
             </div>
           </div>
-        )}
-
-        {/* File Upload */}
-        <div className="bg-white rounded-lg shadow-sm p-6 mb-6">
-          <label
-            className={`flex flex-col items-center justify-center w-full h-32 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${
-              isDragging
-                ? 'border-blue-500 bg-blue-50'
-                : 'border-gray-300 hover:border-blue-500 hover:bg-gray-50'
-            }`}
-            onDragOver={handleDragOver}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            <div className="flex flex-col items-center justify-center pt-5 pb-6 pointer-events-none">
-              <Upload className={`w-10 h-10 mb-2 ${isDragging ? 'text-blue-500' : 'text-gray-400'}`} />
-              <p className="text-sm text-gray-600">
-                <span className="font-semibold">Click to upload</span> or drag and drop
-              </p>
-              <p className="text-xs text-gray-500 mt-1">Images, Subtitles, Video & Audio files supported</p>
-            </div>
-            <input
-              type="file"
-              className="hidden"
-              accept={allAccepts}
-              multiple
-              onChange={handleFileUpload}
-            />
-          </label>
+          
+          {/* Instructions */}
+          <div className="bg-slate-800 rounded-2xl p-6 shadow-sm border border-slate-700 text-slate-300">
+             <h4 className="font-semibold text-white mb-4 text-sm">How it works</h4>
+             <ul className="space-y-3 text-sm">
+               <li className="flex gap-3"><span className="text-blue-400 font-bold">1</span> <span>Upload files by clicking or dragging</span></li>
+               <li className="flex gap-3"><span className="text-blue-400 font-bold">2</span> <span>Choose target output formats</span></li>
+               <li className="flex gap-3"><span className="text-blue-400 font-bold">3</span> <span>Convert instantly in your browser</span></li>
+               <li className="flex gap-3"><span className="text-blue-400 font-bold">4</span> <span>Download single files or bundled ZIP</span></li>
+             </ul>
+          </div>
         </div>
 
-        {/* Summary Stats */}
-        {conversions.length > 0 && (
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-            <div className="bg-white rounded-lg shadow-sm p-4">
-              <div className="flex items-center justify-between">
+        {/* Right Column: Dynamic Content Area */}
+        <div className="flex-1 min-w-0 w-full space-y-6">
+          
+          {/* FFmpeg Load Warning or Status */}
+          {ffmpegError ? (
+            <div className="bg-red-50 border border-red-200 rounded-2xl p-5 shadow-sm">
+              <div className="flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                 <div>
-                  <p className="text-sm text-gray-600">Total Files</p>
-                  <p className="text-2xl font-bold text-gray-900">{conversions.length}</p>
-                </div>
-                <FileText className="w-8 h-8 text-gray-400" />
-              </div>
-            </div>
-            <div className="bg-white rounded-lg shadow-sm p-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-gray-600">Converting</p>
-                  <p className="text-2xl font-bold text-blue-600">{convertingConversions.length}</p>
-                </div>
-                <Loader2 className="w-8 h-8 text-blue-400 animate-spin" />
-              </div>
-            </div>
-            <div className="bg-white rounded-lg shadow-sm p-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-gray-600">Completed</p>
-                  <p className="text-2xl font-bold text-green-600">{completedConversions.length}</p>
-                </div>
-                <CheckCircle2 className="w-8 h-8 text-green-400" />
-              </div>
-            </div>
-            <div className="bg-white rounded-lg shadow-sm p-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-gray-600">Failed</p>
-                  <p className="text-2xl font-bold text-red-600">{failedConversions.length}</p>
-                </div>
-                <AlertCircle className="w-8 h-8 text-red-400" />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Batch Actions */}
-        {conversions.length > 0 && (
-          <div className="bg-white rounded-lg shadow-sm p-4 mb-6">
-            <div className="flex justify-between items-center">
-              <div className="flex items-center gap-4">
-                <h2 className="text-xl font-semibold text-gray-900">
-                  Conversions ({conversions.length})
-                </h2>
-                {completedConversions.length > 0 && (
-                  <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.size === completedConversions.length && completedConversions.length > 0}
-                      onChange={toggleSelectAll}
-                      className="w-4 h-4 text-blue-600 rounded focus:ring-2 focus:ring-blue-500"
-                    />
-                    Select all completed
-                  </label>
-                )}
-              </div>
-              <div className="flex gap-3">
-                {selectedValidCount > 0 && (
-                  <button
-                    onClick={downloadSelected}
-                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                  <h3 className="font-semibold text-red-900 mb-1">FFmpeg Initialization Failed</h3>
+                  <p className="text-sm text-red-800 leading-relaxed mb-3">
+                    {ffmpegError} You can still convert images and subtitles natively.
+                  </p>
+                  <button 
+                    onClick={loadFfmpeg}
+                    className="text-xs bg-red-100 hover:bg-red-200 text-red-800 font-semibold px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5"
                   >
-                    {selectedValidCount === 1 ? (
-                      <>
-                        <Download className="w-4 h-4" />
-                        Download Selected (1)
-                      </>
-                    ) : (
-                      <>
-                        <DownloadCloud className="w-4 h-4" />
-                        Download as ZIP ({selectedValidCount})
-                      </>
-                    )}
+                    <RefreshCw className="w-3.5 h-3.5" /> Retry Loading
                   </button>
-                )}
-                <button
-                  onClick={() => {
-                    setConversions([]);
-                    setSelectedIds(new Set());
-                  }}
-                  className="flex items-center gap-2 px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors"
-                >
-                  Clear All
-                </button>
+                </div>
               </div>
             </div>
+          ) : !isFfmpegLoaded && hasMediaFiles ? (
+            <div className="bg-blue-50 border border-blue-200 rounded-2xl p-5 shadow-sm">
+              <div className="flex items-start gap-3">
+                {isFfmpegLoading ? (
+                  <Loader2 className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5 animate-spin" />
+                ) : (
+                  <Info className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+                )}
+                <div>
+                  <h3 className="font-semibold text-blue-900 mb-1">
+                    {isFfmpegLoading ? 'Loading FFmpeg Engine...' : 'FFmpeg Engine Required'}
+                  </h3>
+                  <p className="text-sm text-blue-800 leading-relaxed mb-3">
+                    Video and audio conversions require the FFmpeg WebAssembly engine to be loaded into your browser's memory. This is a one-time download (~30MB) for this session.
+                  </p>
+                  {!isFfmpegLoading && (
+                    <button 
+                      onClick={loadFfmpeg}
+                      className="text-sm bg-blue-600 hover:bg-blue-700 text-white font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm"
+                    >
+                      Load Engine Now
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {/* File Upload Area */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden p-2">
+            <label
+              className={`flex flex-col items-center justify-center w-full min-h-[160px] border-2 border-dashed rounded-xl cursor-pointer transition-all duration-200 ease-in-out ${
+                isDragging
+                  ? 'border-blue-500 bg-blue-50 scale-[0.99] shadow-inner'
+                  : 'border-slate-300 hover:border-blue-400 hover:bg-slate-50'
+              }`}
+              onDragOver={handleDragOver}
+              onDragEnter={handleDragEnter}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
+              <div className="flex flex-col items-center justify-center py-8 px-4 text-center pointer-events-none">
+                <div className={`p-4 rounded-full mb-4 transition-colors ${isDragging ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-500'}`}>
+                  <Upload className="w-8 h-8" />
+                </div>
+                <p className="text-lg text-slate-700 mb-1">
+                  <span className="font-semibold text-blue-600">Click to upload</span> or drag and drop
+                </p>
+                <p className="text-sm text-slate-500">Images, Subtitles, Video & Audio files supported</p>
+              </div>
+              <input
+                type="file"
+                className="hidden"
+                accept={allAccepts}
+                multiple
+                onChange={handleFileUpload}
+              />
+            </label>
           </div>
-        )}
 
-        {/* Conversions List */}
-        {conversions.length > 0 && (
-          <div className="space-y-4 mb-6">
-            {conversions.map((conversion) => {
-              const fileType = getFileType(conversion.fileName);
-              const TypeIcon = fileType !== 'unknown' ? SUPPORTED_CONVERSIONS[fileType].icon : FileText;
-              const availableFormats = getAvailableFormats(conversion.fileName);
+          {/* Summary Stats Grid */}
+          {conversions.length > 0 && (
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex flex-col">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-sm font-medium text-slate-500">Total Files</p>
+                  <div className="p-2 bg-slate-50 rounded-lg"><FileText className="w-4 h-4 text-slate-400" /></div>
+                </div>
+                <p className="text-3xl font-bold text-slate-800">{conversions.length}</p>
+              </div>
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex flex-col">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-sm font-medium text-slate-500">Converting</p>
+                  <div className="p-2 bg-blue-50 rounded-lg"><Loader2 className="w-4 h-4 text-blue-500 animate-spin" /></div>
+                </div>
+                <p className="text-3xl font-bold text-blue-600">{convertingConversions.length}</p>
+              </div>
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex flex-col">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-sm font-medium text-slate-500">Completed</p>
+                  <div className="p-2 bg-emerald-50 rounded-lg"><CheckCircle2 className="w-4 h-4 text-emerald-500" /></div>
+                </div>
+                <p className="text-3xl font-bold text-emerald-600">{completedConversions.length}</p>
+              </div>
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex flex-col">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-sm font-medium text-slate-500">Failed</p>
+                  <div className="p-2 bg-red-50 rounded-lg"><AlertCircle className="w-4 h-4 text-red-500" /></div>
+                </div>
+                <p className="text-3xl font-bold text-red-600">{failedConversions.length}</p>
+              </div>
+            </div>
+          )}
 
-              return (
-                <div
-                  key={conversion.id}
-                  className={`bg-white rounded-lg shadow-sm p-6 border-l-4 ${
-                    conversion.status === 'completed'
-                      ? 'border-l-green-500'
-                      : conversion.status === 'failed'
-                      ? 'border-l-red-500'
-                      : conversion.status === 'converting'
-                      ? 'border-l-blue-500'
-                      : 'border-l-gray-300'
-                  }`}
-                >
-                  <div className="flex items-start justify-between mb-4">
-                    <div className="flex items-start gap-3 flex-1">
-                      {conversion.status === 'completed' ? (
-                        <input
-                          type="checkbox"
-                          checked={selectedIds.has(conversion.id)}
-                          onChange={() => toggleSelection(conversion.id)}
-                          className="w-5 h-5 text-blue-600 rounded focus:ring-2 focus:ring-blue-500 mt-0.5 cursor-pointer"
-                        />
+          {/* Batch Actions Bar */}
+          {conversions.length > 0 && (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sticky top-4 z-10">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-6">
+                  <h2 className="text-lg font-bold text-slate-800">
+                    Queue ({conversions.length})
+                  </h2>
+                  {completedConversions.length > 0 && (
+                    <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer hover:text-slate-900 transition-colors bg-slate-50 px-3 py-1.5 rounded-lg border border-slate-200">
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.size === completedConversions.length && completedConversions.length > 0}
+                        onChange={toggleSelectAll}
+                        className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                      />
+                      Select all completed
+                    </label>
+                  )}
+                </div>
+                <div className="flex items-center gap-3 w-full sm:w-auto">
+                  {selectedValidCount > 0 && (
+                    <button
+                      onClick={downloadSelected}
+                      className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white font-medium rounded-xl hover:bg-blue-700 transition-colors shadow-sm"
+                    >
+                      {selectedValidCount === 1 ? (
+                        <>
+                          <Download className="w-4 h-4" />
+                          Download Selected (1)
+                        </>
                       ) : (
-                        <div className="w-5 h-5 mt-0.5" />
+                        <>
+                          <DownloadCloud className="w-4 h-4" />
+                          Download ZIP ({selectedValidCount})
+                        </>
                       )}
-                      {conversion.status === 'completed' ? (
-                        <CheckCircle2 className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
-                      ) : conversion.status === 'failed' ? (
-                        <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                      ) : conversion.status === 'converting' ? (
-                        <Loader2 className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5 animate-spin" />
-                      ) : (
-                        <TypeIcon className="w-5 h-5 text-gray-400 flex-shrink-0 mt-0.5" />
-                      )}
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-1 flex-wrap">
-                          <h3 className="font-semibold text-gray-900">{conversion.fileName}</h3>
-                          <span className="text-xs text-gray-500">({formatBytes(conversion.fileSize)})</span>
-                          {fileType !== 'unknown' && (
-                            <span className={`text-xs px-2 py-0.5 rounded ${
-                              fileType === 'image'
-                                ? 'bg-green-100 text-green-700'
-                                : fileType === 'subtitle'
-                                ? 'bg-purple-100 text-purple-700'
-                                : fileType === 'video'
-                                ? 'bg-blue-100 text-blue-700'
-                                : 'bg-orange-100 text-orange-700'
-                            }`}>
-                              {fileType.charAt(0).toUpperCase() + fileType.slice(1)}
-                            </span>
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      setConversions([]);
+                      setSelectedIds(new Set());
+                    }}
+                    className="flex items-center justify-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 font-medium rounded-xl hover:bg-slate-200 transition-colors border border-slate-200"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Conversions List */}
+          {conversions.length > 0 && (
+            <div className="space-y-3">
+              {conversions.map((conversion) => {
+                const fileType = getFileType(conversion.fileName);
+                const TypeIcon = fileType !== 'unknown' ? SUPPORTED_CONVERSIONS[fileType].icon : FileText;
+                const availableFormats = getAvailableFormats(conversion.fileName);
+
+                return (
+                  <div
+                    key={conversion.id}
+                    className={`bg-white rounded-2xl shadow-sm p-5 border border-slate-200 transition-all hover:shadow-md ${
+                      conversion.status === 'completed'
+                        ? 'border-l-4 border-l-emerald-500'
+                        : conversion.status === 'failed'
+                        ? 'border-l-4 border-l-red-500'
+                        : conversion.status === 'converting'
+                        ? 'border-l-4 border-l-blue-500'
+                        : 'border-l-4 border-l-slate-300'
+                    }`}
+                  >
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                      <div className="flex items-start gap-4 flex-1 w-full">
+                        <div className="mt-1 flex items-center">
+                          {conversion.status === 'completed' ? (
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.has(conversion.id)}
+                              onChange={() => toggleSelection(conversion.id)}
+                              className="w-5 h-5 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer"
+                            />
+                          ) : (
+                            <div className="w-5 h-5" />
                           )}
                         </div>
+                        
+                        <div className={`p-2 rounded-xl flex-shrink-0 ${
+                            conversion.status === 'completed' ? 'bg-emerald-50 text-emerald-600' : 
+                            conversion.status === 'failed' ? 'bg-red-50 text-red-600' : 
+                            conversion.status === 'converting' ? 'bg-blue-50 text-blue-600' : 
+                            'bg-slate-50 text-slate-500'
+                        }`}>
+                          {conversion.status === 'completed' ? (
+                            <CheckCircle2 className="w-5 h-5" />
+                          ) : conversion.status === 'failed' ? (
+                            <AlertCircle className="w-5 h-5" />
+                          ) : conversion.status === 'converting' ? (
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                          ) : (
+                            <TypeIcon className="w-5 h-5" />
+                          )}
+                        </div>
+                        
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                            <h3 className="font-semibold text-slate-900 truncate">{conversion.fileName}</h3>
+                            <span className="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md">
+                              {formatBytes(conversion.fileSize)}
+                            </span>
+                            {fileType !== 'unknown' && (
+                              <span className={`text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-md ${
+                                fileType === 'image'
+                                  ? 'bg-emerald-100 text-emerald-700'
+                                  : fileType === 'subtitle'
+                                  ? 'bg-purple-100 text-purple-700'
+                                  : fileType === 'video'
+                                  ? 'bg-blue-100 text-blue-700'
+                                  : 'bg-orange-100 text-orange-700'
+                              }`}>
+                                {fileType}
+                              </span>
+                            )}
+                          </div>
 
-                        {conversion.status === 'pending' && (
-                          <div className="mt-3 space-y-2">
-                            <div className="flex items-center gap-2">
-                              <span className="text-sm text-gray-600">Convert to:</span>
-                              <select
-                                value={conversion.outputFormat}
-                                onChange={(e) => changeOutputFormat(conversion.id, e.target.value)}
-                                className="text-sm border border-gray-300 rounded px-2 py-1 focus:ring-2 focus:ring-blue-500"
-                              >
-                                {availableFormats.map(format => (
-                                  <option key={format} value={format}>{format.toUpperCase()}</option>
-                                ))}
-                              </select>
-                            </div>
-                            {(() => {
-                              const recommended = getRecommendedFormats(conversion.fileName);
-                              return recommended.length > 0 && (
-                                <div className="flex items-center gap-2">
-                                  <span className="text-xs text-gray-500">Quick select:</span>
-                                  <div className="flex gap-1">
-                                    {recommended.map(format => (
-                                      <button
-                                        key={format}
-                                        onClick={() => changeOutputFormat(conversion.id, format)}
-                                        className={`px-2 py-1 text-xs rounded transition-colors ${
-                                          conversion.outputFormat === format
-                                            ? 'bg-blue-600 text-white'
-                                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                                        }`}
-                                      >
-                                        {format.toUpperCase()}
-                                      </button>
+                          {conversion.status === 'pending' && (
+                            <div className="mt-3 bg-slate-50 border border-slate-100 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center gap-4">
+                              <div className="flex items-center gap-3">
+                                <span className="text-sm font-medium text-slate-600 whitespace-nowrap">Convert to:</span>
+                                <div className="relative">
+                                  <select
+                                    value={conversion.outputFormat}
+                                    onChange={(e) => changeOutputFormat(conversion.id, e.target.value)}
+                                    className="appearance-none text-sm font-medium border border-slate-300 rounded-lg pl-3 pr-8 py-1.5 bg-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500 cursor-pointer shadow-sm"
+                                  >
+                                    {availableFormats.map(format => (
+                                      <option key={format} value={format}>{format.toUpperCase()}</option>
                                     ))}
+                                  </select>
+                                  <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-500">
+                                    <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
                                   </div>
                                 </div>
-                              );
-                            })()}
-                          </div>
-                        )}
+                              </div>
+                              
+                              {(() => {
+                                const recommended = getRecommendedFormats(conversion.fileName);
+                                return recommended.length > 0 && (
+                                  <>
+                                    <div className="hidden sm:block w-px h-6 bg-slate-200" />
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-xs text-slate-500 whitespace-nowrap">Quick select:</span>
+                                      <div className="flex flex-wrap gap-1.5">
+                                        {recommended.map(format => (
+                                          <button
+                                            key={format}
+                                            onClick={() => changeOutputFormat(conversion.id, format)}
+                                            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-all shadow-sm ${
+                                              conversion.outputFormat === format
+                                                ? 'bg-slate-800 text-white'
+                                                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                                            }`}
+                                          >
+                                            {format.toUpperCase()}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          )}
 
-                        {conversion.status === 'converting' && (
-                          <p className="text-sm text-blue-700 mt-1">
-                            Converting to {conversion.outputFormat.toUpperCase()}...
-                          </p>
-                        )}
+                          {conversion.status === 'converting' && (
+                            <div className="mt-2 flex items-center gap-2">
+                              <div className="h-1.5 w-24 bg-blue-100 rounded-full overflow-hidden">
+                                <div 
+                                  className="h-full bg-blue-500 rounded-full transition-all duration-300 ease-out" 
+                                  style={{width: conversion.progress !== undefined ? `${conversion.progress}%` : '60%'}}
+                                ></div>
+                              </div>
+                              <p className="text-sm font-medium text-blue-600">
+                                {conversion.progress !== undefined 
+                                  ? `Converting ${conversion.progress}%...`
+                                  : `Converting to ${conversion.outputFormat.toUpperCase()}...`}
+                              </p>
+                            </div>
+                          )}
 
+                          {conversion.status === 'completed' && (
+                            <div className="mt-2 inline-flex items-center gap-1.5 text-sm font-medium text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md">
+                              ✓ Converted to {conversion.outputFormat.toUpperCase()}
+                              {conversion.outputSize && <span className="text-emerald-600 opacity-80">({formatBytes(conversion.outputSize)})</span>}
+                            </div>
+                          )}
+
+                          {conversion.status === 'failed' && (
+                            <p className="text-sm font-medium text-red-600 mt-2 bg-red-50 px-3 py-1.5 rounded-md inline-block">
+                              Failed: {conversion.error || 'Unknown error'}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      
+                      <div className="flex items-center gap-2 w-full sm:w-auto justify-end mt-2 sm:mt-0 pl-14 sm:pl-0">
                         {conversion.status === 'completed' && (
-                          <p className="text-sm text-green-700 mt-1">
-                            ✓ Converted to {conversion.outputFormat.toUpperCase()}
-                            {conversion.outputSize && ` (${formatBytes(conversion.outputSize)})`}
-                          </p>
+                          <button
+                            onClick={() => downloadFile(conversion)}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 text-slate-700 font-medium text-sm rounded-lg hover:bg-slate-50 hover:text-slate-900 transition-colors shadow-sm"
+                          >
+                            <Download className="w-4 h-4 text-slate-500" />
+                            Download
+                          </button>
                         )}
-
                         {conversion.status === 'failed' && (
-                          <p className="text-sm text-red-700 mt-1">
-                            Failed: {conversion.error || 'Unknown error'}
-                          </p>
+                          <button
+                            onClick={() => retryConversion(conversion)}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-red-50 border border-red-200 text-red-700 font-medium text-sm rounded-lg hover:bg-red-100 transition-colors"
+                          >
+                            Retry
+                          </button>
                         )}
+                        {conversion.status === 'pending' && (
+                          <button
+                            onClick={() => convertFile(conversion)}
+                            className="flex items-center gap-2 px-4 py-1.5 bg-slate-900 text-white font-medium text-sm rounded-lg hover:bg-slate-800 transition-colors shadow-sm"
+                          >
+                            Convert
+                          </button>
+                        )}
+                        <button
+                          onClick={() => removeConversion(conversion.id)}
+                          className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-transparent hover:border-red-100"
+                          aria-label="Remove"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      {conversion.status === 'completed' && (
-                        <button
-                          onClick={() => downloadFile(conversion)}
-                          className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 transition-colors"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                          Download
-                        </button>
-                      )}
-                      {conversion.status === 'failed' && (
-                        <button
-                          onClick={() => retryConversion(conversion)}
-                          className="flex items-center gap-2 px-3 py-1.5 bg-orange-600 text-white text-sm rounded hover:bg-orange-700 transition-colors"
-                        >
-                          Retry
-                        </button>
-                      )}
-                      {conversion.status === 'pending' && (
-                        <button
-                          onClick={() => convertFile(conversion)}
-                          className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 transition-colors"
-                        >
-                          Convert
-                        </button>
-                      )}
-                      <button
-                        onClick={() => removeConversion(conversion.id)}
-                        className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
-                        aria-label="Remove"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    </div>
                   </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+                );
+              })}
+            </div>
+          )}
 
-        {/* Empty State */}
-        {conversions.length === 0 && (
-          <div className="bg-white rounded-lg shadow-sm p-12 text-center">
-            <Upload className="w-16 h-16 text-gray-300 mx-auto mb-4" />
-            <h3 className="text-lg font-semibold text-gray-900 mb-2">No files uploaded yet</h3>
-            <p className="text-gray-600">Upload images, subtitles, video, or audio files to get started</p>
-            <p className="text-sm text-gray-500 mt-2">(Video & audio require local installation with FFmpeg)</p>
-          </div>
-        )}
+          {/* Empty State */}
+          {conversions.length === 0 && (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-12 text-center flex flex-col items-center justify-center min-h-[300px]">
+              <div className="w-20 h-20 bg-slate-50 rounded-full flex items-center justify-center mb-6">
+                <Upload className="w-10 h-10 text-slate-300" />
+              </div>
+              <h3 className="text-xl font-bold text-slate-800 mb-2">Ready to convert</h3>
+              <p className="text-slate-500 max-w-sm mx-auto mb-2">
+                Drop your files here to get started. Images and subtitles process instantly in your browser.
+              </p>
+              <p className="text-xs text-slate-400">
+                (Video & audio uses WebAssembly FFmpeg inside your browser memory)
+              </p>
+            </div>
+          )}
 
-        {/* Info Section */}
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-6 mt-6">
-          <h3 className="font-semibold text-blue-900 mb-3">Supported Conversions</h3>
-          <div className="grid md:grid-cols-2 gap-4">
-            <div>
-              <p className="text-sm font-semibold text-green-700 mb-1 flex items-center gap-1">
-                <ImageIcon className="w-4 h-4" /> Images (Browser-native ✓)
-              </p>
-              <p className="text-sm text-gray-700 mb-2">PNG, JPG, JPEG, WebP</p>
-              <div className="flex flex-wrap gap-1 text-xs text-gray-600">
-                <span className="bg-green-50 border border-green-200 px-2 py-1 rounded">PNG → JPG</span>
-                <span className="bg-green-50 border border-green-200 px-2 py-1 rounded">JPG → WebP</span>
-                <span className="bg-green-50 border border-green-200 px-2 py-1 rounded">WebP → PNG</span>
-              </div>
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-purple-700 mb-1 flex items-center gap-1">
-                <FileCode className="w-4 h-4" /> Subtitles (Browser-native ✓)
-              </p>
-              <p className="text-sm text-gray-700 mb-2">SRT, VTT, SBV (YouTube)</p>
-              <div className="flex flex-wrap gap-1 text-xs text-gray-600">
-                <span className="bg-purple-50 border border-purple-200 px-2 py-1 rounded">SRT → VTT</span>
-                <span className="bg-purple-50 border border-purple-200 px-2 py-1 rounded">VTT → SRT</span>
-                <span className="bg-purple-50 border border-purple-200 px-2 py-1 rounded">SRT → SBV</span>
-              </div>
-            </div>
-            <div className="opacity-60">
-              <p className="text-sm font-semibold text-blue-700 mb-1 flex items-center gap-1">
-                <Film className="w-4 h-4" /> Video (Requires FFmpeg)
-              </p>
-              <p className="text-sm text-gray-700 mb-2">MP4, WebM, AVI, MOV, MKV, FLV</p>
-              <div className="flex flex-wrap gap-1 text-xs text-gray-600">
-                <span className="bg-blue-50 border border-blue-200 px-2 py-1 rounded">WebM → MP4</span>
-                <span className="bg-blue-50 border border-blue-200 px-2 py-1 rounded">AVI → MP4</span>
-                <span className="bg-blue-50 border border-blue-200 px-2 py-1 rounded">MOV → MP4</span>
-              </div>
-            </div>
-            <div className="opacity-60">
-              <p className="text-sm font-semibold text-orange-700 mb-1 flex items-center gap-1">
-                <Music className="w-4 h-4" /> Audio (Requires FFmpeg)
-              </p>
-              <p className="text-sm text-gray-700 mb-2">MP3, WAV, OGG, AAC, M4A, FLAC</p>
-              <div className="flex flex-wrap gap-1 text-xs text-gray-600">
-                <span className="bg-orange-50 border border-orange-200 px-2 py-1 rounded">MP3 → WAV</span>
-                <span className="bg-orange-50 border border-orange-200 px-2 py-1 rounded">WAV → MP3</span>
-                <span className="bg-orange-50 border border-orange-200 px-2 py-1 rounded">FLAC → MP3</span>
-              </div>
-            </div>
-          </div>
-          <div className="mt-4 pt-4 border-t border-blue-200">
-            <h4 className="text-sm font-semibold text-blue-900 mb-2">How to use:</h4>
-            <ul className="text-xs text-blue-700 space-y-1">
-              <li>• Upload files by clicking or dragging them into the upload area</li>
-              <li>• Choose your target format from the dropdown or use quick-select buttons</li>
-              <li>• Click "Convert" to process the file (images & subtitles work instantly)</li>
-              <li>• Download individual files or select multiple to download as ZIP</li>
-            </ul>
-          </div>
-          <div className="mt-3 pt-3 border-t border-blue-200">
-            <p className="text-xs text-blue-700">
-              <strong>🔒 100% Private:</strong> All conversions happen in your browser - no files are uploaded to any server.
-              Perfect for organizations with strict data security policies.
-            </p>
-          </div>
         </div>
       </div>
     </div>

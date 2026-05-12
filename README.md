@@ -1,7 +1,7 @@
 
-  # SRT to VTT Converter
+  # Universal File Converter
 
-  This is a code bundle for SRT to VTT Converter. The original project is available at https://www.figma.com/design/vJnFl1x6QmTaAEOl5RD8lj/SRT-to-VTT-Converter.
+  This is a code bundle for Universal File Converter. The original project is available at https://www.figma.com/design/vJnFl1x6QmTaAEOl5RD8lj/Universal-File-Converter.
 
   ## Running the code
 
